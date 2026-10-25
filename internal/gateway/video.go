@@ -407,6 +407,78 @@ func volcengineVideoBody(model string, f filming) []byte {
 	return b
 }
 
+// family MiniMax's video models are known by.
+const miniMaxVideoFamily = "MiniMax-Hailuo"
+
+// filmsMiniMax is whether p is a MiniMax preset, whose videos magpie asks of
+// its own API: POST <chat base>/video_generation starts one and answers with
+// its task_id, GET <chat base>/query/video_generation says how it goes and
+// names the file, and GET <chat base>/files/retrieve turns that into a URL.
+func filmsMiniMax(p provider.Provider) bool {
+	return p.Preset == "minimax" || p.Preset == "minimax-cn"
+}
+
+// miniMaxVideoBody is f as MiniMax's videos API takes it: the duration in
+// whole seconds, a resolution rather than a size, and the first frame as a
+// data URL. MiniMax takes no mode and no aspect ratio on this endpoint (it
+// answers 2013 for either), so they are not sent.
+func miniMaxVideoBody(model string, f filming) ([]byte, error) {
+	req := map[string]any{"model": model, "prompt": f.Prompt}
+	if f.Seconds != "" {
+		n, err := parseSeconds(f.Seconds)
+		if err != nil {
+			return nil, err
+		}
+		req["duration"] = n
+	}
+	// size is WIDTHxHEIGHT, as every other videos request writes it; MiniMax
+	// names tiers instead (512P/768P/1080P), by the shorter side.
+	switch videoResolution(model, f.Size) {
+	case "480p":
+		req["resolution"] = "512P"
+	case "720p":
+		req["resolution"] = "768P"
+	case "1080p":
+		req["resolution"] = "1080P"
+	}
+	if f.Start != nil {
+		req["first_frame_image"] = f.Start.dataURL()
+	}
+	return json.Marshal(req)
+}
+
+// miniMaxEnvelopeError is the failure MiniMax reports inside a 200: its
+// base_resp carries the status code (2056 out of quota, 2069 a model it no
+// longer serves, 2013 a parameter it won't take). nil when it reports none.
+func miniMaxEnvelopeError(b []byte) error {
+	var envelope struct {
+		BaseResp struct {
+			StatusCode int    `json:"status_code"`
+			StatusMsg  string `json:"status_msg"`
+		} `json:"base_resp"`
+	}
+	if err := json.Unmarshal(b, &envelope); err != nil {
+		return nil
+	}
+	if envelope.BaseResp.StatusCode == 0 {
+		return nil
+	}
+	return fmt.Errorf("minimax %d: %s", envelope.BaseResp.StatusCode, envelope.BaseResp.StatusMsg)
+}
+
+// miniMaxState is how MiniMax's words for a video read as magpie's: Success
+// is done, Fail failed, and Preparing/Queueing/Processing are still running.
+func miniMaxState(st *videoState) {
+	switch strings.ToLower(strings.TrimSpace(st.Status)) {
+	case "success", "succeeded", "done":
+		st.Status = "done"
+	case "fail", "failed":
+		st.Status = "failed"
+	default:
+		st.Status = "running"
+	}
+}
+
 // grokVideoBody is f as Grok's video API takes it: the duration in whole
 // seconds, an aspect ratio and a resolution rather than a size, the first
 // frame as image and the subjects to draw from as reference_images. What
@@ -481,7 +553,18 @@ type videoState struct {
 	Status   string `json:"status"`
 	Progress int    `json:"progress"`
 	Model    string `json:"model"`
-	Video    struct {
+	// MiniMax answers its own envelope: task_id at the start, file_id when it
+	// is done, and a base_resp that carries the failure even on a 200.
+	TaskID string `json:"task_id"`
+	FileID string `json:"file_id"`
+	File   struct {
+		DownloadURL string `json:"download_url"`
+	} `json:"file"`
+	BaseResp struct {
+		StatusCode int    `json:"status_code"`
+		StatusMsg  string `json:"status_msg"`
+	} `json:"base_resp"`
+	Video struct {
 		URL      string  `json:"url"`
 		Duration float64 `json:"duration"`
 	} `json:"video"`
@@ -638,6 +721,9 @@ func (s *Server) videoStatus(ctx context.Context, p provider.Provider, vendorID 
 	if p.Preset == "volcengine" {
 		at = strings.TrimRight(p.Base(provider.Responses), "/") + "/contents/generations/tasks/" + url.PathEscape(vendorID)
 	}
+	if filmsMiniMax(p) {
+		at = strings.TrimRight(p.Base(provider.Chat), "/") + "/query/video_generation?task_id=" + url.QueryEscape(vendorID)
+	}
 	b, code, err := s.sendAs(ctx, p, http.MethodGet, at, "", nil, true)
 	if err != nil {
 		return st, code, err
@@ -645,7 +731,49 @@ func (s *Server) videoStatus(ctx context.Context, p provider.Provider, vendorID 
 	if err := json.Unmarshal(b, &st); err != nil {
 		return st, 502, fmt.Errorf("%s's answer isn't a video's: %v", p.Name, err)
 	}
+	if filmsMiniMax(p) {
+		if envelopeErr := miniMaxEnvelopeError(b); envelopeErr != nil {
+			return st, 502, envelopeErr
+		}
+		miniMaxState(&st)
+		if st.Status == "done" {
+			// MiniMax names a file, not a URL: /files/retrieve is the step
+			// that turns file_id into the download the gateway can read.
+			if st.FileID == "" {
+				return st, 502, fmt.Errorf("%s finished the video without a file_id", p.Name)
+			}
+			file, fileCode, fileErr := s.miniMaxFile(ctx, p, st.FileID)
+			if fileErr != nil {
+				return st, fileCode, fileErr
+			}
+			st.Video.URL = file
+		}
+	}
 	return st, code, nil
+}
+
+// miniMaxFile turns MiniMax's file_id into the URL its video downloads from.
+func (s *Server) miniMaxFile(ctx context.Context, p provider.Provider, fileID string) (string, int, error) {
+	at := strings.TrimRight(p.Base(provider.Chat), "/") + "/files/retrieve?file_id=" + url.QueryEscape(fileID)
+	b, code, err := s.sendAs(ctx, p, http.MethodGet, at, "", nil, true)
+	if err != nil {
+		return "", code, err
+	}
+	if envelopeErr := miniMaxEnvelopeError(b); envelopeErr != nil {
+		return "", 502, envelopeErr
+	}
+	var file struct {
+		File struct {
+			DownloadURL string `json:"download_url"`
+		} `json:"file"`
+	}
+	if err := json.Unmarshal(b, &file); err != nil {
+		return "", 502, fmt.Errorf("%s's file isn't a file's: %v", p.Name, err)
+	}
+	if file.File.DownloadURL == "" {
+		return "", 502, fmt.Errorf("%s returned no download_url for the video", p.Name)
+	}
+	return file.File.DownloadURL, code, nil
 }
 
 // videosCreate starts a video and answers with its id.
@@ -866,10 +994,11 @@ func (s *Server) startVideo(ctx context.Context, r *http.Request, p provider.Pro
 	v := videoStart{p: p, remote: p.IsRemoteMagpie()}
 	v.custom = !v.remote && filmsCustom(p, model)
 	volcengine := p.Preset == "volcengine" && slices.ContainsFunc(p.PlanVideos(), func(m catalog.Model) bool { return m.ID == model })
+	minimax := filmsMiniMax(p) && slices.ContainsFunc(p.PlanVideos(), func(m catalog.Model) bool { return m.ID == model })
 	// any grok-imagine-video*, not only those listed: the vendor's newer ones work before magpie names them
-	if !v.remote && !v.custom && !volcengine && (!drawsGrok(p) || !strings.HasPrefix(model, grokVideoFamily)) {
+	if !v.remote && !v.custom && !volcengine && !minimax && (!drawsGrok(p) || !strings.HasPrefix(model, grokVideoFamily)) {
 		v.unfit = true
-		return v, 400, fmt.Errorf(`%s/%s can't make videos: magpie makes videos with a Grok subscription's grok-imagine-video, Volcengine Agent Plan's Seedance models, another magpie's, and a provider's models its own model list marks "kind": "video" or that you mark a Video model (right-click the model in the provider's editor: Makes…)`, p.ID, model)
+		return v, 400, fmt.Errorf(`%s/%s can't make videos: magpie makes videos with a Grok subscription's grok-imagine-video, Volcengine Agent Plan's Seedance models, MiniMax's Hailuo models, another magpie's, and a provider's models its own model list marks "kind": "video" or that you mark a Video model (right-click the model in the provider's editor: Makes…)`, p.ID, model)
 	}
 	// another magpie is asked at its videos API, which says itself what
 	// it can't make
@@ -882,6 +1011,12 @@ func (s *Server) startVideo(ctx context.Context, r *http.Request, p provider.Pro
 		at, field, body = videoBase(p)+"/videos", "id", remoteVideoBody(model, f)
 	case volcengine:
 		at, field, body = strings.TrimRight(p.Base(provider.Responses), "/")+"/contents/generations/tasks", "id", volcengineVideoBody(model, f)
+	case minimax:
+		at, field = strings.TrimRight(p.Base(provider.Chat), "/")+"/video_generation", "task_id"
+		var err error
+		if body, err = miniMaxVideoBody(model, f); err != nil {
+			return v, 400, err
+		}
 	default:
 		var err error
 		if body, err = grokVideoBody(model, f); err != nil {
@@ -897,6 +1032,13 @@ func (s *Server) startVideo(ctx context.Context, r *http.Request, p provider.Pro
 		b, code, err = s.send(ctx, p, at, "application/json", body, true)
 	}
 	v.p, v.answer = p, b
+	if err == nil && minimax {
+		// MiniMax says "accepted" and "out of quota" in the same 200: the
+		// envelope, not the status line, is its answer.
+		if envelopeErr := miniMaxEnvelopeError(b); envelopeErr != nil {
+			return v, 502, envelopeErr
+		}
+	}
 	return v, code, err
 }
 

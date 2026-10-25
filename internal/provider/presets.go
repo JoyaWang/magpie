@@ -8,6 +8,20 @@ import (
 // A preset is a vendor magpie already knows: adding one only asks for the key.
 
 // Kind groups presets in the picker.
+// MiniMaxVideos are the video-generation models a MiniMax preset makes videos
+// with, at its own videos API (POST /video_generation, GET
+// /query/video_generation, GET /files/retrieve). Hailuo 2.3 and 02 are the
+// current ones; the Director and I2V models are kept for the older keys that
+// still serve them.
+var MiniMaxVideos = []string{
+	"MiniMax-Hailuo-2.3",
+	"MiniMax-Hailuo-2.3-Fast",
+	"MiniMax-Hailuo-02",
+	"T2V-01-Director",
+	"I2V-01-Director",
+	"I2V-01",
+}
+
 type Kind string
 
 const (
@@ -49,6 +63,9 @@ type PresetDef struct {
 	// Models are the plan's, for when the list has none of them.
 	Only   string   `json:"only,omitempty"`
 	Models []string `json:"models,omitempty"`
+	// Videos are a vendor's video-generation models when it has one list and
+	// no regions (MiniMax's Hailuo): PlanVideos reads them as a region's.
+	Videos []string `json:"videos,omitempty"`
 	// NoList: the vendor has no list of models to ask for (Bedrock's
 	// runtime serves no /models), so Models are its list
 	NoList bool `json:"noList,omitempty"`
@@ -183,10 +200,12 @@ var presets = []PresetDef{
 		}},
 	{ID: "minimax", Name: "MiniMax", Icon: "minimax-color", Kind: KindVendor, Catalog: "minimax",
 		Chat: "https://api.minimax.io/v1", Anthropic: "https://api.minimax.io/anthropic",
-		Website: "https://platform.minimax.io", KeysURL: "https://platform.minimax.io/user-center/basic-information/interface-key"},
+		Website: "https://platform.minimax.io", KeysURL: "https://platform.minimax.io/user-center/basic-information/interface-key",
+		Videos: MiniMaxVideos},
 	{ID: "minimax-cn", Name: "MiniMax (China)", Icon: "minimax-color", Kind: KindVendor, Catalog: "minimax",
 		Chat: "https://api.minimaxi.com/v1", Anthropic: "https://api.minimaxi.com/anthropic",
-		Website: "https://platform.minimaxi.com", KeysURL: "https://platform.minimaxi.com/user-center/basic-information/interface-key"},
+		Website: "https://platform.minimaxi.com", KeysURL: "https://platform.minimaxi.com/user-center/basic-information/interface-key",
+		Videos: MiniMaxVideos},
 	// a Step Plan is served at its own endpoints (step_plan/…), its key
 	// refused at the pay-as-you-go ones
 	{ID: "stepfun", Name: "StepFun", Icon: "stepfun-color", Kind: KindVendor, Catalog: "stepfun-ai-step-plan, stepfun-ai",

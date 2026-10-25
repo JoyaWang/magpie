@@ -1106,7 +1106,20 @@ func (p Provider) PlanDrawers() []catalog.Model {
 // PlanVideos are the video-generation models explicitly included in the
 // preset region's plan.
 func (p Provider) PlanVideos() []catalog.Model {
-	return p.planMedia(func(r *Region) []string { return r.Videos }, false, true)
+	if out := p.planMedia(func(r *Region) []string { return r.Videos }, false, true); len(out) > 0 {
+		return out
+	}
+	// A vendor with one list and no regions (MiniMax's Hailuo) declares its
+	// videos on the preset itself.
+	pr := Preset(p.Preset)
+	if pr == nil || len(pr.Videos) == 0 {
+		return nil
+	}
+	out := make([]catalog.Model, 0, len(pr.Videos))
+	for _, id := range pr.Videos {
+		out = append(out, catalog.Model{ID: id, Name: id, Provider: p.ID, Films: true})
+	}
+	return out
 }
 
 func (p Provider) planMedia(ids func(*Region) []string, draws, films bool) []catalog.Model {
